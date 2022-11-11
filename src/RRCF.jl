@@ -1,8 +1,7 @@
 module RRCF
 using Base: ident_cmp
-using StatsBase
-using JSON3
 import Base.show
+using StatsBase
 """
 Leaf of RCTree containing no children and at most one parent.
 Attributes:
@@ -16,13 +15,14 @@ Attributes:
 """
 abstract type Node end
 
-struct Leaf <: Node
-    i :: UInt32
+
+mutable struct Leaf <: Node
+const i :: UInt32
     d :: UInt16
-    u 
-    x 
-    n
-    b
+    u :: Union{Node, Nothing}
+    x :: Vector{Real}
+    n :: UInt16
+    b 
 end
 Leaf(; i,d,u,x,n) = Leaf(i,d,u,x,n,[x])
 function show(io::IO, obj::Leaf)
@@ -45,10 +45,10 @@ const   p :: Float32
         l :: Union{Node, Nothing}
         r :: Union{Node, Nothing}
         u :: Union{Node, Nothing}
-        n :: UInt32
+        n :: Int32
         b
 end
-Branch(q,p, u;l=nothing, r=nothing, n=zero(UInt32), b=zero(UInt16)) = Branch(UInt16(q),Float32(p),l,r,u,n,b)
+Branch(q,p, u;l=nothing, r=nothing, n=zero(Int32), b=Vector{Vector{Float32}}()) = Branch(UInt16(q),Float32(p),l,r,u,n,b)
 function show(io::IO, obj::Branch)
     println(io, "Branch(q=$(obj.q), p=$(obj.p)")
 end
@@ -98,14 +98,15 @@ Example:
 """
 mutable struct RCTree <: Node
 const ndim          :: UInt16 # dimension of points in the tree
-      X             # d x N array
       index_labels  :: Vector{UInt32}
       precision     :: Float32
-      root          :: Node# Branch or Leaf instance Pointer to root of tree.
-      leaves        :: Dict # Dict containing pointers to all leaves in tree.
+      root          :: Union{Nothing, Branch, Leaf}# Branch or Leaf instance Pointer to root of tree.
+      leaves        :: Dict{UInt32, Leaf} # Dict containing pointers to all leaves in tree.
     RCTree(ndim::Int) = begin
         x = new(UInt16(ndim)); 
-        x.root = x
+        x.root = nothing
+        x.leaves = Dict{UInt32, Leaf}()
+        x
     end
 end
 function RCTree(X::Vector{Vector{T}}where T; index_labels=nothing, precision=9)
@@ -121,22 +122,437 @@ function RCTree(X::Vector{Vector{T}}where T; index_labels=nothing, precision=9)
         X = uX
     end
     n = length(X)
-    mktree(self, X, ones(Bool, n), nX, iX, self.root)
+    mktree(self, X, BitVector(ones(n)), convert(Vector{UInt32},nX), iX, self)
     self.root.u = nothing
     count_all_top_down(self.root)
     get_bbox_top_down(self.root)
     self
 end
 
-function insert_point end
-function forget_point end
-function disp end
-function codisp end
-function map_leaves end
-function map_branches end
-function query end
+"""md
+Search for leaf nearest to point
+
+    function query(point::Vector{T}where T, node::Union{Branch, Leaf})
+
+Parameters:
+-----------
+point: np.ndarray (1 x d)
+       Point to search for
+node: Branch instance
+      Defaults to root node
+Returns:
+--------
+nearest: Leaf
+         Leaf nearest to queried point in the tree
+Example:
+--------
+# Create RCTree
+>>> X = np.random.randn(10, 2)
+>>> tree = rrcf.RCTree(X)
+# Insert new point
+>>> new_point = np.array([4, 4])
+>>> tree.insert_point(new_point, index=10)
+# Query tree for point with added noise
+>>> tree.query(new_point + 1e-5)
+Leaf(10)
+"""
+function query(point::Vector{T}where T, node::Union{Branch, Leaf})::Leaf
+    if isa(node, Leaf)
+        return node
+    else
+        point[node.q] <= node.p ? query(point, node.l) : query(point, node.r)
+    end
+end
+
+"""
+Generates the cut dimension and cut value based on the InsertPoint algorithm.
+
+    function insert_point_cut(point::Vector{T}, bbox::Vector{Vector{T}}) where T
+
+Parameters:
+-----------
+point: np.ndarray (1 x d)
+       New point to be inserted.
+bbox: np.ndarray(2 x d)
+      Bounding box of point set S.
+Returns:
+--------
+cut_dimension: int
+               Dimension to cut over.
+cut: float
+     Value of cut.
+Example:
+--------
+# Generate cut dimension and cut value
+>>> _insert_point_cut(x_inital, bbox)
+(0, 0.9758881798109296)
+"""
+function insert_point_cut(point::Vector{T}, bbox::Vector{Vector{T}}) where T
+    # Generate the bounding box
+    # @assert length(bbox) == 2
+    bbox_hat = [min.(bbox[1], point), max.(bbox[end], point)]
+    b_span = bbox_hat[end] - bbox_hat[1]
+    b_range = reduce(+, b_span)
+    r = rand(T)*b_range
+    accum = zero(T)
+    cut_dimention = UInt16(0)
+    while accum < r
+        cut_dimention += one(cut_dimention)
+        accum += b_span[cut_dimention]
+    end
+    cut = bbox_hat[1][cut_dimention] + accum - r
+    return cut_dimention, cut
+end
+
+"""
+Called when new point is inserted. Expands bbox of all nodes above new point
+if point is outside the existing bbox.
+"""
+function tighten_bbox_upwards(node::Branch, point::Vector{T} where T)
+    while !isnothing(node)
+        lt = node.b[1] .> point
+        gt = node.b[end] .< point 
+        lt_any = any(lt)
+        gt_any = any(gt)
+        if lt_any || gt_any
+            if lt_any
+                node.b[1][lt] = point[lt]
+            end
+            if gt_any
+                node.b[end][gt] = point[gt]
+            end
+        else
+            break
+        end
+        node = node.u
+    end
+end
+
+"""
+Inserts a point into the tree, creating a new leaf
+Parameters:
+-----------
+point: np.ndarray (1 x d)
+index: (Hashable type)
+       Identifier for new leaf in tree
+tolerance: float
+           Tolerance for determining duplicate points
+Returns:
+--------
+leaf: Leaf
+      New leaf in tree
+Example:
+--------
+# Create RCTree
+>>> tree = RCTree()
+# Insert a point
+>>> x = np.random.randn(2)
+>>> tree.insert_point(x, index=0)
+"""
+function insert_point(tree::RCTree, point::Vector{T}, index::UInt32, tolerance::T=zero(T)):: Leaf where T<:Real
+    @assert length(point) == tree.ndim
+    if isnothing(tree.root)
+        leaf = Leaf(x=point, i=index, u=nothing, d=0, n=1)
+        tree.root = leaf
+        tree.leaves[index] = leaf
+        return leaf
+    end
+    # Check for existing index in leaves dict
+    @assert !haskey(tree.leaves, index)
+    # Check for duplicate points
+    duplicate = find_duplicate(tree, point, tolerance)
+    if !isnothing(duplicate)
+        increase_leaf_count_upwards(duplicate)
+        tree.leaves[index] = duplicate
+        return duplicate
+    end
+    # If tree has points and point is not a duplicate, continue with main algorithm...
+    node = tree.root
+    parent = node.u
+    maxdepth, _ = findmax(x->x.d, collect(values(tree.leaves)))
+    depth = one(UInt16)
+    branch = node
+    side = :r
+    for d in 0:maxdepth
+        bbox = node.b
+        cut_dimension, cut = insert_point_cut(point, bbox)
+        if cut <= bbox[1][cut_dimension]
+            leaf = Leaf(x=point, i=index, d=depth, u=nothing,n=1)
+            branch = Branch(cut_dimension, cut, nothing, l=leaf, r=node,
+                            n=(leaf.n + node.n))
+            break
+        elseif cut >= bbox[end][cut_dimension]
+            leaf = Leaf(x=point, i=index, d=depth, u=nothing, n=1)
+            branch = Branch(cut_dimension, cut, nothing, l=node, r=leaf,
+                            n=(leaf.n + node.n))
+            break
+        else
+            depth += one(depth)
+            if point[node.q] <= node.p
+                parent = node
+                node = node.l
+                side = :l
+            else
+                parent = node
+                node = node.r
+                side = :r
+            end
+        end
+    end
+    branch.b = lr_branch_bbox(branch)
+    # Set parent of new leaf and old branch
+    node.u = branch
+    leaf.u = branch
+    # Set parent of new branch
+    branch.u = parent
+    if !isnothing(parent)
+        # Set child of parent to new branch
+        setproperty!(parent, side, branch)
+        increase_leaf_count_upwards(parent)
+        tighten_bbox_upwards(parent, point)
+    else
+        # If a new root was created, assign the attribute
+        tree.root = branch
+    end
+    # Increment depths below branch
+    map_leaves(node, (x)->x.d+=one(x.d))
+    # Add leaf to leaves dict
+    tree.leaves[index] = leaf
+    # Return inserted leaf for convenience
+    return leaf
+end
+"""
+Delete leaf from tree
+Parameters:
+-----------
+index: (Hashable type)
+       Index of leaf in tree
+Returns:
+--------
+leaf: Leaf instance
+      Deleted leaf
+Example:
+--------
+# Create RCTree
+>>> tree = RCTree()
+# Insert a point
+>>> x = np.random.randn(2)
+>>> tree.insert_point(x, index=0)
+# Forget point
+>>> tree.forget_point(0)
+"""
+function forget_point(tree::RCTree, index) 
+    @assert haskey(tree.leaves, index)
+    leaf = tree.leaves[index]
+    # If duplicate points exist...
+    if leaf.n > 1
+        # Simply decrement the number of points in the leaf and for all branches above
+        decrease_leaf_count_upwards(leaf)
+        return tree.leaves.pop(index)
+    end
+    # Weird cases here:
+    # If leaf is the root...
+    if isa(self.root, Leaf) && (leaf === self.root)
+        tree.root = nothing
+        return tree.leaves.pop(index)
+    end
+    # Find parent
+    parent = leaf.u
+    # Find sibling
+    if isa(parent.l, Leaf) && (leaf == parent.l)
+        sibling = parent.r
+    else
+        sibling = parent.l
+    end
+    # If parent is the root...
+    if parent === tree.root
+        # Set sibling as new root
+        sibling.u = nothing
+        tree.root = sibling
+        # Update depths
+        if isa(sibling, Leaf)
+            sibling.d = 0
+        else
+            tree.map_leaves(sibling, op=(x)->x.d-=one(x.d))
+        end
+        return tree.leaves.pop(index)
+    end
+    # Find grandparent
+    grandparent = parent.u
+    # Set parent of sibling to grandparent
+    sibling.u = grandparent
+    # Short-circuit grandparent to sibling
+    if parent === grandparent.l
+        grandparent.l = sibling
+    else
+        grandparent.r = sibling
+    end
+    # Update depths
+    parent = grandparent
+    map_leaves(sibling, op=(x)->x.d-=one(x.d))
+    # Update leaf counts under each branch
+    decrease_leaf_count_upwards(parent)
+    # Update bounding boxes
+    point = leaf.x
+    relax_bbox_upwards(parent, point)
+    return self.leaves.pop(index)
+end
+
+"""
+Compute displacement at leaf
+Parameters:
+-----------
+leaf: index of leaf or Leaf instance
+Returns:
+--------
+displacement: int
+              Displacement if leaf is removed
+Example:
+--------
+# Create RCTree
+>>> X = np.random.randn(100, 2)
+>>> tree = rrcf.RCTree(X)
+>>> new_point = np.array([4, 4])
+>>> tree.insert_point(new_point, index=100)
+# Compute displacement
+>>> tree.disp(100)
+12
+"""
+function disp(leaf::Leaf) 
+    # Handle case where leaf is root
+    if leaf.d === 0
+        return 0
+    end
+    parent = leaf.u
+    # Find sibling
+    sibling = (leaf === parent.l) ? parent.r : parent.l
+    # Count number of nodes in sibling subtree
+    sibling.n
+end
+
+disp(tree::RCTree, index::Int) = disp(tree.leaves[index])
+
+"""
+Compute collusive displacement at leaf
+Parameters:
+-----------
+leaf: index of leaf or Leaf instance
+Returns:
+--------
+codisplacement: float
+                Collusive displacement if leaf is removed.
+Example:
+--------
+# Create RCTree
+>>> X = np.random.randn(100, 2)
+>>> tree = rrcf.RCTree(X)
+>>> new_point = np.array([4, 4])
+>>> tree.insert_point(new_point, index=100)
+# Compute collusive displacement
+>>> tree.codisp(100)
+31.667
+"""
+function codisp(leaf::Leaf)
+    # Handle case where leaf is root
+    if leaf.d === 0
+        return 0 
+    end
+    node = leaf
+    results = []
+    while !isnothing(node.u)
+        parent = node.u
+        sibling = (node === parent.l) ? parent.r : parent.l
+        result = (sibling.n / node.n)
+        push!(results, result)
+        node = parent
+    end
+    co_displacement,_ = findmax(identity, results)
+    return co_displacement
+end
+codisp(tree::RCTree, index::Int) = codisp(tree.leaves[index])
+
+function relax_bbox_upwards(node::Branch, point)
+    if !all(broadcast((x,y,z)->x!=y && x!=z, point, node.b[1], node.b[end]))
+        node.b = lr_branch_bbox(node)
+        relax_bbox_upwards(node.u, point)
+    end
+end
+
+"""
+Traverse tree recursively, calling operation given by op on leaves
+Parameters:
+-----------
+node: node in RCTree
+op: function to call on each leaf
+*args: positional arguments to op
+**kwargs: keyword arguments to op
+Returns:
+--------
+None
+Example:
+--------
+# Use map_leaves to print leaves in postorder
+>>> X = np.random.randn(10, 2)
+>>> tree = RCTree(X)
+>>> tree.map_leaves(tree.root, op=print)
+Leaf(5)
+Leaf(9)
+Leaf(4)
+Leaf(0)
+Leaf(6)
+Leaf(2)
+Leaf(3)
+Leaf(7)
+Leaf(1)
+Leaf(8)
+"""
+function map_leaves(node::Branch, op::Function=(x)->nothing; kwargs...) 
+    isnothing(node.l) || map_leaves(node.l, op, kwargs...)
+    isnothing(node.r) || map_leaves(node.r, op, kwargs...)
+end
+map_leaves(node::Leaf, op::Function=()->nothing; kwargs...) = op(node, kwargs...)
+"""
+Traverse tree recursively, calling operation given by op on branches
+Parameters:
+-----------
+node: node in RCTree
+op: function to call on each branch
+*args: positional arguments to op
+**kwargs: keyword arguments to op
+Returns:
+--------
+None
+Example:
+--------
+# Use map_branches to collect all branches in a list
+>>> X = np.random.randn(10, 2)
+>>> tree = RCTree(X)
+>>> branches = []
+>>> tree.map_branches(tree.root, op=(lambda x, stack: stack.append(x)),
+                    stack=branches)
+>>> branches
+[Branch(q=0, p=-0.53),
+Branch(q=0, p=-0.35),
+Branch(q=1, p=-0.67),
+Branch(q=0, p=-0.15),
+Branch(q=0, p=0.23),
+Branch(q=1, p=0.29),
+Branch(q=1, p=1.31),
+Branch(q=0, p=0.62),
+Branch(q=1, p=0.86)]
+"""
+function map_branches(node::Branch, op::Function=(x)->nothing; kwargs...) 
+    isa(node.l, Branch) && map_branches(node.l, op, kwargs...)
+    isa(node.r, Branch) && map_branches(node.r, op, kwargs...)
+    op(kwargs...)
+end
+
 function get_bbox end
-function find_duplicate end
+function find_duplicate(tree::RCTree, point::Vector{T}, tolerance=zero(T))where T
+    @assert length(point) == tree.ndim
+    nearest = query(point, tree.root)
+    isapprox(nearest.x, point, atol=tolerance) ? nearest : nothing
+end
 
 """
 Create a leaf node from isolated point
@@ -166,11 +582,26 @@ function show(io::IO, obj::RCTree)
             print_pop()
         end
     end 
+    print_tree(::Nothing) = ""
     print_tree(obj.root)
     println(io, treestr)
 end
 
-function addleaf(t::RCTree, branch::Branch, X::Vector{Vector{T}}where T, S::Vector{Bool}, side::Symbol, depth::UInt16, N::Vector, I::Vector)
+"""
+Called after inserting or removing leaves. Updates the stored count of leaves
+beneath each branch (branch.n).
+"""
+function increase_leaf_count_upwards(node::Node)
+    node.n += one(node.n)
+    isnothing(node.u) || increase_leaf_count_upwards(node.u)
+end
+
+function decrease_leaf_count_upwards(node::Node)
+    node.n -= one(typeof(node.n))
+    isnothing(node.u) || decrease_leaf_count_upwards(node.u)
+end
+
+function addleaf(t::RCTree, branch::Branch, X::Vector{Vector{T}}where T, S::BitVector, side::Symbol, depth::UInt16, N::Vector, I::Vector)
     i = findfirst(S)
     leaf = Leaf(i=i, d=depth, u=branch, x=X[i], n=N[i])
     # Link leaf node to parent
@@ -191,11 +622,14 @@ function addleaf(t::RCTree, branch::Branch, X::Vector{Vector{T}}where T, S::Vect
     end
 end
 
-function mktree(t::RCTree, X, S, N, I, parent::Union{RCTree, Branch}, side=:root, depth::UInt16=UInt16(0))
+function mktree(t::RCTree, X::Vector{Vector{T}}where T, S::BitVector, N::Vector{UInt32}, I, parent::Union{RCTree, Branch}, side=:root, depth::UInt16=UInt16(0))
     # Increment depth as we traverse down
     depth += one(depth)
     # Create a cut according to definition 1
-    S1, S2, branch = cut(X, S, parent, side)
+    S1, S2, branch = cut(X, S, parent)
+
+    setproperty!(parent, side, branch)
+
     # If S1 does not contain an isolated point...
     if count(S1) > 1 
         mktree(t, X, S1, N, I, branch, :l, depth)
@@ -210,7 +644,7 @@ function mktree(t::RCTree, X, S, N, I, parent::Union{RCTree, Branch}, side=:root
     end
 end
 
-function cut(X::Vector{Vector{T}}where T, S::Vector{Bool}, parent::Union{Branch, RCTree}, side::Symbol=:l)
+function cut(X::Vector{Vector{T}}where T, S::BitVector, parent::Union{Branch, RCTree})
     xmin = [1f35 for x in 1:length(X[1])]
     xmax = [-1f35 for x in 1:length(X[1])]
     for (x,b) in zip(X,S) 
@@ -227,15 +661,12 @@ function cut(X::Vector{Vector{T}}where T, S::Vector{Bool}, parent::Union{Branch,
     # Determine value for split
     p = rand()* (xmax[q]-xmin[q]) + xmin[q]
     # Determine subset of points to left
-    S1 = [s && (x[q]<=p) for (x,s) in zip(X,S)]
+    S1 = ([x[q] for x in X] .<= p) .& S #[s && (x[q]<=p) for (x,s) in zip(X,S)]
     # Determine subset of points to right
-    S2 = map((x,y)->!x && y, S1, S)
+    S2 = broadcast(~, S1) .& S #map((x,y)->!x && y, S1, S)
     # Create new child node
     child = Branch(q, p, parent)
-    # Link child node to parent
-    if !isa(parent, Nothing)
-        setproperty!(parent, side, child)
-    end
+
     return S1, S2, child
 end
 
@@ -258,5 +689,17 @@ function get_bbox_top_down(node::Branch)
     node.b = lr_branch_bbox(node)
 end
 
-
+export 
+    # structs
+    RCTree,
+    # functions
+    insert_point,
+    forget_point,
+    disp,
+    codisp,
+    map_leaves,
+    map_branches,
+    query,
+    get_bbox,
+    find_duplicate
 end
